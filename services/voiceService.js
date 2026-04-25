@@ -132,4 +132,51 @@ async function playInVoice(member, text, guildId) {
     }
 }
 
-module.exports = { playInVoice };
+// ─── Play on an existing connection ───────────────────────────────
+// Like playInVoice but uses an already-open connection and does NOT destroy
+// it afterwards. Used by voiceFlirtHandler so monitoring persists after TTS.
+
+const playingOnConnection = new Set(); // guildId → playing
+
+async function playOnConnection(connection, guildId, text) {
+    if (playingOnConnection.has(guildId)) {
+        console.log('[Voice] Already playing on connection, skipping.');
+        return false;
+    }
+    playingOnConnection.add(guildId);
+
+    try {
+        console.log(`[Voice] Fetching TTS (in-channel): "${text}"`);
+        const buffer = await fetchTTS(text);
+
+        const readable = new Readable();
+        readable.push(buffer);
+        readable.push(null);
+
+        const ffmpeg = new prism.FFmpeg({
+            args: ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2'],
+        });
+
+        const resource = createAudioResource(readable.pipe(ffmpeg), {
+            inputType: StreamType.Raw,
+        });
+
+        const player = createAudioPlayer();
+        player.on('error', err => console.error('[Voice] Player error:', err.message));
+
+        connection.subscribe(player);
+        player.play(resource);
+
+        await entersState(player, AudioPlayerStatus.Idle, 60_000);
+        console.log('[Voice] In-channel playback done.');
+        return true;
+
+    } catch (err) {
+        console.error('[Voice] playOnConnection error:', err.message);
+        return false;
+    } finally {
+        playingOnConnection.delete(guildId);
+    }
+}
+
+module.exports = { playInVoice, playOnConnection };

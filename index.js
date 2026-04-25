@@ -12,7 +12,7 @@ const {
 } = require('discord.js');
 
 const { handle }      = require('./handlers/messageHandler');
-const { playInVoice } = require('./services/voiceService');
+const { joinAndMonitor, onMemberLeave } = require('./handlers/voiceFlirtHandler');
 const state           = require('./state/stateManager');
 
 const REQUIRED_ENV = ['DISCORD_TOKEN', 'CLIENT_ID'];
@@ -103,15 +103,30 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ─── Voice join detection (ONE handler, with lock) ────────────────
+// ─── Voice state updates ──────────────────────────────────────────────────────
 const voiceJoinLock = new Set();
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
-    const member = newState.member;
+    const member = newState.member ?? oldState.member;
     if (!member || member.user.bot) return;
-    if (oldState.channelId || !newState.channelId) return; // only fresh joins
 
-    const guildId = newState.guild.id;
+    const guildId = (newState.guild ?? oldState.guild).id;
+
+    // ── Member left a channel ────────────────────────────────────────────────
+    if (oldState.channelId && !newState.channelId) {
+        onMemberLeave(oldState);
+        return;
+    }
+
+    // ── Member moved between channels ────────────────────────────────────────
+    if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+        onMemberLeave(oldState); // may trigger leave-if-empty for old channel
+        // fall through to handle as a fresh join in the new channel
+    }
+
+    // ── Fresh join ───────────────────────────────────────────────────────────
+    if (!newState.channelId) return;
+
     if (voiceJoinLock.has(guildId)) return;
     voiceJoinLock.add(guildId);
 
@@ -125,7 +140,13 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             return;
         }
 
-        await playInVoice(freshMember, "Attention. You have entered a monitored voice session.", guildId);
+        // Find the first text channel the bot can write to (for moderation messages)
+        const textChannel = newState.guild.channels.cache.find(
+            ch => ch.isTextBased() && ch.permissionsFor(newState.guild.members.me)?.has('SendMessages')
+        ) ?? null;
+
+        await joinAndMonitor(freshMember, guildId, textChannel);
+
     } finally {
         voiceJoinLock.delete(guildId);
     }

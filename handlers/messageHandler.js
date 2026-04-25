@@ -3,7 +3,8 @@
 const state                             = require('../state/stateManager');
 const { scoreMessage, extractTargetId } = require('../services/scoringService');
 const { analyzeImage, getImageUrls }    = require('../services/visionService');
-const { playInVoice }                   = require('../services/voiceService');
+const { speakInGuild }                  = require('./voiceFlirtHandler');
+const { generateAdaptiveQuip }          = require('../services/adaptiveQuipService');
 const { handleDMEscalation, handleCheatDetection, handleTimeout } = require('../services/moderationService');
 const { pickMild, pickStrong, pickAggressive, pickVoice, pickMeme } = require('../config/responses');
 
@@ -62,9 +63,16 @@ async function handle(message) {
     // 5. Chat response
     try {
         let reply;
-        if      (score >= THRESH_AGGRESSIVE) reply = pickAggressive();
-        else if (score >= THRESH_STRONG)     reply = pickStrong();
-        else                                 reply = pickMild();
+        if (score >= THRESH_AGGRESSIVE) {
+            // Generate a quip that references what they actually said
+            reply = await generateAdaptiveQuip(message.content, score, message.author.username)
+                 ?? pickAggressive();
+        } else if (score >= THRESH_STRONG) {
+            reply = await generateAdaptiveQuip(message.content, score, message.author.username)
+                 ?? pickStrong();
+        } else {
+            reply = pickMild();
+        }
 
         if (imageScore >= 20) reply += '\n📸 *And the image makes it worse.*';
         await message.channel.send(reply);
@@ -85,8 +93,11 @@ async function handle(message) {
         const lastVoice = voiceCooldown.get(voiceKey);
         if (!lastVoice || Date.now() - lastVoice >= 60000) {
             voiceCooldown.set(voiceKey, Date.now());
-            const voiceText = pickVoice().replace('{user}', message.author.username);
-            playInVoice(message.member, voiceText, message.guild.id)
+            // Generate an adaptive voice quip referencing what they said
+            const voiceText = await generateAdaptiveQuip(
+                message.content, score, message.author.username, true
+            ) ?? pickVoice().replace('{user}', message.author.username);
+            speakInGuild(message.member, voiceText, message.guild.id)
                 .catch(err => console.error('[Handler] Voice error:', err.message));
         }
     }

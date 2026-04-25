@@ -2,7 +2,7 @@
 
 const { GoogleGenAI } = require('@google/genai');
 
-const MODEL = process.env.GEMMA_MODEL || 'gemini-2.5-flash';
+const MODEL = process.env.GEMMA_MODEL || 'gemma-4-26b-a4b-it';
 console.log(`[Gemma] Using model: ${MODEL}`);
 
 let genAI = null;
@@ -38,10 +38,11 @@ async function scoreMessage(content) {
         const result = await getClient().models.generateContent({
             model: MODEL,
             config: {
-                temperature:     0.1,
-                maxOutputTokens: 500,
+                systemInstruction: SYSTEM_PROMPT,  // Gemma 4 native system prompt support
+                temperature:       0.1,
+                maxOutputTokens:   500,
             },
-            contents: `${SYSTEM_PROMPT}\n\nRate this message: "${content}"`,
+            contents: `Rate this message: "${content}"`,
         });
 
         const raw = result.text?.trim();
