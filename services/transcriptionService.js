@@ -33,16 +33,16 @@ function pcmToWav(pcmBuffer, sampleRate = 48_000, channels = 2) {
 // ─── Whisper transcription ────────────────────────────────────────────────────
 
 async function transcribeBuffer(pcmBuffer) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error('OPENAI_API_KEY not set — add it to .env to enable voice flirt detection');
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) throw new Error('GROQ_API_KEY not set — add it to .env to enable voice flirt detection');
 
     const wav  = pcmToWav(pcmBuffer);
     const form = new FormData();
     form.append('file',  new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
-    form.append('model', 'whisper-1');
+    form.append('model', 'whisper-large-v3-turbo');
     form.append('language', 'en');
 
-    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
         method:  'POST',
         headers: { Authorization: `Bearer ${apiKey}` },
         body:    form,
@@ -50,7 +50,7 @@ async function transcribeBuffer(pcmBuffer) {
 
     if (!res.ok) {
         const body = await res.text().catch(() => '');
-        throw new Error(`Whisper HTTP ${res.status}: ${body}`);
+        throw new Error(`Groq Whisper HTTP ${res.status}: ${body}`);
     }
 
     const data = await res.json();
@@ -84,17 +84,24 @@ function subscribeToUtterance(receiver, userId, onTranscript) {
         const pcm = Buffer.concat(chunks);
         if (pcm.length < MIN_PCM_BYTES) {
             console.log('[Transcription] Utterance too short, skipping.');
+            try { await onTranscript(null); } catch (_) {}
             return;
         }
 
+        let text = null;
         try {
-            const text = await transcribeBuffer(pcm);
+            text = await transcribeBuffer(pcm);
             if (text) {
                 console.log(`[Transcription] Captured: "${text}"`);
-                await onTranscript(text);
             }
         } catch (err) {
             console.error('[Transcription] Error:', err.message);
+        }
+
+        // Always invoke callback so the caller can release any per-user
+        // locks. text is null when nothing usable was captured.
+        try { await onTranscript(text || null); } catch (cbErr) {
+            console.error('[Transcription] Callback error:', cbErr.message);
         }
     });
 

@@ -20,12 +20,32 @@ const { handleDMEscalation, handleCheatDetection, handleTimeout } = require('../
 const VOICE_FLIRT_THRESHOLD = 35; // lower than text — transcription loses nuance
 const VOICE_STRONG_THRESHOLD = 60;
 
+// Cooldown after the bot calls a user out in voice. While on cooldown, we skip
+// the entire pipeline (transcription + scoring + quip) for that user — saves
+// API quota and prevents the bot from spamming someone who keeps talking.
+// Set per-user-per-guild. Override via env var if needed.
+const VOICE_CALLOUT_COOLDOWN_MS = Number(process.env.VOICE_CALLOUT_COOLDOWN_MS) || 15_000;
+
 // ─── Per-guild state ──────────────────────────────────────────────────────────
 // guildId → Set<userId> — tracks users we've already subscribed to this utterance
 const subscribedUsers = new Map();
 
 // guildId → { connection, guild, textChannel }
 const activeMonitors = new Map();
+
+// `${guildId}-${userId}` → timestamp of last callout. Used to suppress
+// repeated voice quips at the user level.
+const voiceCalloutCooldown = new Map();
+
+function isOnCalloutCooldown(guildId, userId) {
+    const key = `${guildId}-${userId}`;
+    const last = voiceCalloutCooldown.get(key);
+    return last && (Date.now() - last) < VOICE_CALLOUT_COOLDOWN_MS;
+}
+
+function stampCalloutCooldown(guildId, userId) {
+    voiceCalloutCooldown.set(`${guildId}-${userId}`, Date.now());
+}
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -40,17 +60,41 @@ function setupSpeakingListener(connection, guild, guildId) {
     if (!subscribedUsers.has(guildId)) subscribedUsers.set(guildId, new Set());
     const activeUsers = subscribedUsers.get(guildId);
 
-    receiver.speaking.on('start', (userId) => {
-        // Skip bots and double-subscriptions
+    console.log(`[VoiceFlirt] Speaking listener attached for guild ${guildId}. Receiver: ${!!receiver}`);
+
+    receiver.speaking.on('start', async (userId) => {
+        // Skip double-subscriptions (we're still capturing their previous utterance).
+        // The slot is held until subscribeToUtterance's callback fires (which now
+        // happens for ALL outcomes: success, too-short, or error).
         if (activeUsers.has(userId)) return;
-        const member = guild.members.cache.get(userId);
+
+        // Skip the entire pipeline if this user was just called out — no
+        // transcription, no scoring, no quip generation. This is the rate
+        // limit: one callout per user per VOICE_CALLOUT_COOLDOWN_MS.
+        if (isOnCalloutCooldown(guildId, userId)) return;
+
+        // Try cache first, then fall back to a fetch so we don't drop the event
+        let member = guild.members.cache.get(userId);
+        if (!member) {
+            try {
+                member = await guild.members.fetch(userId);
+            } catch (err) {
+                console.error(`[VoiceFlirt] Could not resolve member ${userId}:`, err.message);
+                return;
+            }
+        }
         if (!member || member.user.bot) return;
 
         activeUsers.add(userId);
         console.log(`[VoiceFlirt] Listening to ${member.user.username}...`);
 
         subscribeToUtterance(receiver, userId, async (transcript) => {
-            activeUsers.delete(userId); // ready for re-subscription on next utterance
+            // Free the slot FIRST — runs in all paths (transcript may be null
+            // for too-short / errored utterances). This unblocks the next
+            // speaking.start for this user.
+            activeUsers.delete(userId);
+
+            if (!transcript) return; // nothing to score
 
             // Score the transcribed speech
             state.ensureUser(userId);
@@ -60,6 +104,12 @@ function setupSpeakingListener(connection, guild, guildId) {
             console.log(`[VoiceFlirt] ${member.user.username.padEnd(20)} | score: ${score} | "${transcript}"`);
 
             if (score < VOICE_FLIRT_THRESHOLD) return;
+
+            // Commit to a callout — stamp the cooldown immediately so any
+            // utterance that arrives while we're generating + speaking the
+            // quip gets dropped at the speaking.start gate.
+            stampCalloutCooldown(guildId, userId);
+            console.log(`[VoiceFlirt] Callout cooldown set for ${member.user.username} (${VOICE_CALLOUT_COOLDOWN_MS}ms)`);
 
             // Generate an adaptive quip that references what they actually said
             const quip = await generateAdaptiveQuip(transcript, score, member.user.username, true)
