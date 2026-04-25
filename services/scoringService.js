@@ -2,11 +2,8 @@
 
 const { GoogleGenAI } = require('@google/genai');
 
-// Gemma 4 model names via Gemini API:
-//   gemma-4-31b-it       — dense 31B (best quality, was the "27B" slot in Gemma 3)
-//   gemma-4-26b-a4b-it   — 26B Mixture-of-Experts (faster, similar quality)
-//   gemma-4-e4b-it       — edge 4B (lightweight)
-const MODEL = process.env.GEMMA_MODEL || 'gemma-4-31b-it';
+const MODEL = process.env.GEMMA_MODEL || 'gemini-2.5-flash';
+console.log(`[Gemma] Using model: ${MODEL}`);
 
 let genAI = null;
 function getClient() {
@@ -18,7 +15,6 @@ function getClient() {
     return genAI;
 }
 
-// ─── System prompt ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a flirt detection system for a Discord moderation bot.
 Analyze messages for flirtatious, romantic, or e-dating behaviour and rate them 0–100.
 
@@ -35,12 +31,6 @@ A message like "you're literally all I need rn" is very high even without classi
 Respond with ONLY valid JSON, no markdown, no explanation:
 {"score": <integer 0-100>, "reason": "<one short sentence>"}`;
 
-// ─── Main scoring function ────────────────────────────────────────────────────
-/**
- * Score a message using Gemma 4. Falls back to 0 on API failure.
- * @param {string} content Raw message text
- * @returns {Promise<number>} Score 0–100
- */
 async function scoreMessage(content) {
     if (!content?.trim()) return 0;
 
@@ -48,20 +38,24 @@ async function scoreMessage(content) {
         const result = await getClient().models.generateContent({
             model: MODEL,
             config: {
-                systemInstruction: SYSTEM_PROMPT,
-                temperature:       0.1,   // low temp = consistent scores
-                maxOutputTokens:   80,
+                temperature:     0.1,
+                maxOutputTokens: 500,
             },
-            contents: `Rate this message: "${content}"`,
+            contents: `${SYSTEM_PROMPT}\n\nRate this message: "${content}"`,
         });
-        const raw = result.text.trim();
 
-        // Strip accidental markdown fences
-        const clean  = raw.replace(/^```(?:json)?|```$/gm, '').trim();
-        const parsed = JSON.parse(clean);
+        const raw = result.text?.trim();
+        if (!raw) { console.error('[Gemma] Empty response'); return 0; }
 
-        const score = Math.min(100, Math.max(0, Math.round(Number(parsed.score))));
-        console.log(`[Gemma] ${score}/100 — ${parsed.reason}`);
+        console.log('[Gemma] Raw:', raw);
+
+        // Extract score even from truncated/malformed JSON
+        const scoreMatch = raw.match(/"score"\s*:\s*(\d+)/);
+        if (!scoreMatch) { console.error('[Gemma] No score found:', raw); return 0; }
+
+        const score = Math.min(100, Math.max(0, Math.round(Number(scoreMatch[1]))));
+        const reasonMatch = raw.match(/"reason"\s*:\s*"([^"]+)"/);
+        console.log(`[Gemma] ${score}/100 — ${reasonMatch?.[1] ?? 'no reason'}`);
         return score;
 
     } catch (err) {
@@ -70,7 +64,6 @@ async function scoreMessage(content) {
     }
 }
 
-// ─── Mention extractor (unchanged) ───────────────────────────────────────────
 function extractTargetId(content) {
     const match = content.match(/<@!?(\d+)>/);
     return match ? match[1] : null;

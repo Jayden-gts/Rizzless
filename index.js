@@ -11,10 +11,10 @@ const {
     EmbedBuilder,
 } = require('discord.js');
 
-const { handle }  = require('./handlers/messageHandler');
-const state       = require('./state/stateManager');
+const { handle }      = require('./handlers/messageHandler');
+const { playInVoice } = require('./services/voiceService');
+const state           = require('./state/stateManager');
 
-// ─── Validate required env vars ───────────────────────────────────────────────
 const REQUIRED_ENV = ['DISCORD_TOKEN', 'CLIENT_ID'];
 for (const key of REQUIRED_ENV) {
     if (!process.env[key]) {
@@ -23,17 +23,15 @@ for (const key of REQUIRED_ENV) {
     }
 }
 
-// ─── Discord client ───────────────────────────────────────────────────────────
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.MessageContent,   // ← Privileged: enable in Dev Portal
-    ],
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+    ]
 });
 
-// ─── Slash command definitions ────────────────────────────────────────────────
 const commands = [
     new SlashCommandBuilder()
         .setName('rizz')
@@ -46,22 +44,17 @@ const commands = [
         .toJSON(),
 ];
 
-// ─── Register slash commands on startup ───────────────────────────────────────
 async function registerCommands() {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
         console.log('📡 Registering slash commands...');
-        await rest.put(
-            Routes.applicationCommands(process.env.CLIENT_ID),
-            { body: commands }
-        );
+        await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
         console.log('✅ Slash commands registered globally.');
     } catch (err) {
         console.error('❌ Failed to register commands:', err.message);
     }
 }
 
-// ─── Rizz status label helper ─────────────────────────────────────────────────
 function getRizzLabel(score) {
     if (score >= 80) return '🔥 Certified Fuckboy/Fuckgirl';
     if (score >= 60) return '😬 Highly Suspicious';
@@ -70,57 +63,80 @@ function getRizzLabel(score) {
 }
 
 function getRizzColour(score) {
-    if (score >= 80) return 0xFF0000;  // red
-    if (score >= 60) return 0xFF8C00;  // orange
-    if (score >= 30) return 0xFFFF00;  // yellow
-    return 0x00CC44;                    // green
+    if (score >= 80) return 0xFF0000;
+    if (score >= 60) return 0xFF8C00;
+    if (score >= 30) return 0xFFFF00;
+    return 0x00CC44;
 }
 
-// ─── Bot ready ───────────────────────────────────────────────────────────────
+// ─── Ready ────────────────────────────────────────────────────────
 client.once('ready', async () => {
     console.log(`\n🤖 Rizzless is online as ${client.user.tag}`);
     console.log(`   Guilds: ${client.guilds.cache.size}`);
     await registerCommands();
 });
 
-// ─── Message events ───────────────────────────────────────────────────────────
+// ─── Messages ─────────────────────────────────────────────────────
 client.on('messageCreate', message => {
     handle(message).catch(err => console.error('[messageCreate]', err));
 });
 
-// ─── Interaction events ───────────────────────────────────────────────────────
+// ─── Slash commands ───────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
-
     if (interaction.commandName === 'rizz') {
         const target   = interaction.options.getUser('user');
         const userData = state.getUser(target.id);
         const score    = userData?.aggregateScore ?? 0;
-        const label    = getRizzLabel(score);
-
-        // Build a clean embed for readability
         const embed = new EmbedBuilder()
             .setTitle('📊 Rizzless Report')
             .setColor(getRizzColour(score))
             .addFields(
-                { name: 'User',   value: `<@${target.id}>`,       inline: true },
-                { name: 'Score',  value: `**${score} / 100**`,     inline: true },
-                { name: 'Status', value: label,                     inline: true },
+                { name: 'User',   value: `<@${target.id}>`,   inline: true },
+                { name: 'Score',  value: `**${score} / 100**`, inline: true },
+                { name: 'Status', value: getRizzLabel(score),   inline: true },
             )
             .setThumbnail(target.displayAvatarURL())
             .setFooter({ text: 'Rizzless — Rizz Detection System' })
             .setTimestamp();
-
         await interaction.reply({ embeds: [embed] });
     }
 });
 
-// ─── Error handling ───────────────────────────────────────────────────────────
-client.on('error',   err => console.error('[Client error]',   err));
-client.on('warn',    msg => console.warn( '[Client warning]', msg));
+// ─── Voice join detection (ONE handler, with lock) ────────────────
+const voiceJoinLock = new Set();
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+    const member = newState.member;
+    if (!member || member.user.bot) return;
+    if (oldState.channelId || !newState.channelId) return; // only fresh joins
+
+    const guildId = newState.guild.id;
+    if (voiceJoinLock.has(guildId)) return;
+    voiceJoinLock.add(guildId);
+
+    try {
+        console.log(`[VC] ${member.user.username} joined voice`);
+        await new Promise(r => setTimeout(r, 2000));
+
+        const freshMember = await newState.guild.members.fetch(member.id);
+        if (!freshMember.voice?.channelId) {
+            console.log('[VC] Member already left, skipping.');
+            return;
+        }
+
+        await playInVoice(freshMember, "Attention. You have entered a monitored voice session.", guildId);
+    } finally {
+        voiceJoinLock.delete(guildId);
+    }
+});
+
+// ─── Errors ───────────────────────────────────────────────────────
+client.on('error', err => console.error('[Client error]', err));
+client.on('warn',  msg => console.warn('[Client warning]', msg));
 process.on('unhandledRejection', err => console.error('[Unhandled rejection]', err));
 
-// ─── Login ────────────────────────────────────────────────────────────────────
+// ─── Login ────────────────────────────────────────────────────────
 client.login(process.env.DISCORD_TOKEN).catch(err => {
     console.error('❌ Login failed:', err.message);
     process.exit(1);
