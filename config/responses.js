@@ -65,11 +65,9 @@ const RESPONSES = {
 
 // ─── Meme / reaction GIF URLs ─────────────────────────────────────────────────
 const MEME_URLS = [
-    'https://media.tenor.com/qvxiRBKP7HYAAAAC/stop-it-get-some-help.gif',
-    'https://media.tenor.com/r5L5qJLyvG4AAAAC/disgusting-gross.gif',
-    'https://media.tenor.com/1IXVdcjzHCMAAAAC/ew-disgusting.gif',
-    'https://media.tenor.com/8bN7WJQM1vkAAAAd/cringe-cringe-compilation.gif',
-    'https://media.tenor.com/RrLpvLpF1BoAAAAd/cringe-oof.gif',
+    'https://media.giphy.com/media/WRQBXSCnEFJIuxktnw/giphy.gif',
+    'https://media.giphy.com/media/Qz4jwODCZJZbG3V7PO/giphy.gif',
+    'https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExdzNua3RidXVxYjVsNGVwZXZvaGo2NHh1OW1seGNueHVzeW94cTdmaSZlcD12MV9naWZzX3NlYXJjaCZjdD1n/PGy6B6TqbBKQHmPxKm/giphy.gif'
 ];
 
 // ─── Rotating index pickers (deterministic, no true randomness) ───────────────
