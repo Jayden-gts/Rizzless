@@ -16,14 +16,30 @@ const {
 } = require('@discordjs/voice');
 
 const { Readable } = require('stream');
-const prism  = require('prism-media');
 const state  = require('../state/stateManager');
 
 const VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
 const API_BASE = 'https://api.elevenlabs.io/v1/text-to-speech';
+const TTS_MODEL = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
 
-const audioCache     = new Map();
-const activeSessions = new Set();
+// Request Opus (Ogg-wrapped) from ElevenLabs. Opus carries channel and
+// sample-rate metadata in the bitstream, so Discord plays it at correct
+// speed/pitch. Saves us the FFmpeg decode step entirely.
+const TTS_OUTPUT_FORMAT = 'opus_48000_128';
+
+const audioCache       = new Map();   // text → PCM buffer
+const activeSessions   = new Set();   // guildId → in-flight playInVoice playback
+const warmConnections  = new Map();   // guildId → { connection, channelId, player, idleTimer }
+
+// Per-connection player cache for monitor-owned connections (voiceFlirtHandler).
+// Keyed by the connection object itself so we don't tear down the monitor's player.
+const connectionPlayers = new WeakMap(); // connection → player
+const connectionLocks   = new WeakMap(); // connection → Promise (serialise plays)
+
+const KEEPALIVE_MS = 60_000; // keep voice connection alive 60s after last play
+
+// Warm sodium once at module load so it's never on the hot path.
+sodium.ready.catch(err => console.error('[Voice] sodium init failed:', err.message));
 
 // ─── TTS ──────────────────────────────────────────────────────────
 async function fetchTTS(text) {
@@ -31,16 +47,17 @@ async function fetchTTS(text) {
     if (!apiKey) throw new Error('ELEVENLABS_API_KEY not set');
     if (audioCache.has(text)) return audioCache.get(text);
 
-    const res = await fetch(`${API_BASE}/${VOICE_ID}`, {
+    const url = `${API_BASE}/${VOICE_ID}?output_format=${TTS_OUTPUT_FORMAT}`;
+    const res = await fetch(url, {
         method: 'POST',
         headers: {
             'xi-api-key':   apiKey,
             'Content-Type': 'application/json',
-            'Accept':       'audio/mpeg',
+            'Accept':       'audio/ogg',
         },
         body: JSON.stringify({
             text,
-            model_id: 'eleven_multilingual_v2',
+            model_id: TTS_MODEL,
             voice_settings: { stability: 0.5, similarity_boost: 0.75 },
         }),
     });
@@ -52,7 +69,145 @@ async function fetchTTS(text) {
     return buffer;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────
+function makeAudioResource(buffer) {
+    const readable = Readable.from(buffer);
+    return createAudioResource(readable, { inputType: StreamType.OggOpus });
+}
+
+// ─── Connection management (for join+leave path) ──────────────────
+function clearIdleTimer(entry) {
+    if (entry?.idleTimer) {
+        clearTimeout(entry.idleTimer);
+        entry.idleTimer = null;
+    }
+}
+
+function scheduleTeardown(guildId) {
+    const entry = warmConnections.get(guildId);
+    if (!entry) return;
+    clearIdleTimer(entry);
+    entry.idleTimer = setTimeout(() => {
+        const current = warmConnections.get(guildId);
+        if (!current) return;
+        try { current.connection.destroy(); } catch (_) {}
+        warmConnections.delete(guildId);
+        console.log('[Voice] Idle teardown.');
+    }, KEEPALIVE_MS);
+}
+
+/**
+ * Get a warm connection we own, or create one. We only ever destroy/replace
+ * a connection that lives in our own warmConnections map — never one owned
+ * by another module (e.g. voiceFlirtHandler's monitoring connection).
+ */
+async function getOrJoinConnection(voiceChannel, guildId) {
+    const existing = warmConnections.get(guildId);
+    if (existing && existing.channelId === voiceChannel.id) {
+        const status = existing.connection.state.status;
+        if (status === VoiceConnectionStatus.Ready ||
+            status === VoiceConnectionStatus.Signalling ||
+            status === VoiceConnectionStatus.Connecting) {
+            clearIdleTimer(existing);
+            if (status !== VoiceConnectionStatus.Ready) {
+                await entersState(existing.connection, VoiceConnectionStatus.Ready, 15_000);
+            }
+            return existing;
+        }
+        try { existing.connection.destroy(); } catch (_) {}
+        warmConnections.delete(guildId);
+    } else if (existing) {
+        try { existing.connection.destroy(); } catch (_) {}
+        warmConnections.delete(guildId);
+    }
+
+    // If discord.js is already tracking a connection for this guild and it
+    // ISN'T ours, that's the monitor — leave it alone and just play through it.
+    const orphan = getVoiceConnection(guildId);
+    if (orphan) {
+        // Caller should have used playOnConnection. Surface this so the bug
+        // is loud rather than silently destroying the monitor.
+        throw new Error(
+            `Voice connection already exists for guild ${guildId} (likely owned by ` +
+            `voiceFlirtHandler). Use playOnConnection / speakInGuild instead of playInVoice.`
+        );
+    }
+
+    const connection = joinVoiceChannel({
+        channelId:      voiceChannel.id,
+        guildId,
+        adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        selfDeaf:       false,
+    });
+
+    const player = createAudioPlayer();
+    player.on('error', err => console.error('[Voice] Player error:', err.message));
+    connection.subscribe(player);
+    connectionPlayers.set(connection, player);
+
+    connection.on(VoiceConnectionStatus.Disconnected, () => {
+        const e = warmConnections.get(guildId);
+        if (e?.connection === connection) warmConnections.delete(guildId);
+    });
+
+    const entry = { connection, channelId: voiceChannel.id, player, idleTimer: null };
+    warmConnections.set(guildId, entry);
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    return entry;
+}
+
+// ─── Public: play on a pre-existing connection ────────────────────
+/**
+ * Speak `text` on an already-connected VoiceConnection without joining or
+ * destroying it. Used by voiceFlirtHandler for its long-lived monitoring
+ * connection. Plays are serialised per connection so back-to-back calls
+ * don't clobber each other.
+ *
+ * Signature kept compatible with voiceFlirtHandler's call sites:
+ *   playOnConnection(connection, guildId, text)
+ */
+async function playOnConnection(connection, guildId, text) {
+    if (!connection) throw new Error('playOnConnection: connection is required');
+
+    // Serialise plays on this connection so a fast-arriving second quip
+    // doesn't interrupt the first one mid-sentence.
+    const previous = connectionLocks.get(connection) || Promise.resolve();
+    let release;
+    const next = new Promise(res => { release = res; });
+    connectionLocks.set(connection, previous.then(() => next));
+
+    try {
+        await previous;
+        await sodium.ready;
+
+        const [buffer] = await Promise.all([
+            fetchTTS(text),
+            connection.state.status === VoiceConnectionStatus.Ready
+                ? Promise.resolve()
+                : entersState(connection, VoiceConnectionStatus.Ready, 15_000),
+        ]);
+
+        // Reuse the connection's player if we have one, otherwise create + subscribe.
+        let player = connectionPlayers.get(connection);
+        if (!player) {
+            player = createAudioPlayer();
+            player.on('error', err => console.error('[Voice] Player error:', err.message));
+            connection.subscribe(player);
+            connectionPlayers.set(connection, player);
+        }
+
+        player.play(makeAudioResource(buffer));
+        await entersState(player, AudioPlayerStatus.Idle, 60_000);
+        return true;
+    } catch (err) {
+        console.error('[Voice] playOnConnection error:', err.message);
+        return false;
+    } finally {
+        release();
+    }
+}
+
+// ─── Public: text-channel triggered, join + speak + auto-teardown ─
 async function playInVoice(member, text, guildId) {
     if (activeSessions.has(guildId))  { console.log('[Voice] Already active.'); return false; }
     if (!state.canJoinVoice(guildId)) { console.log('[Voice] Cooldown.');       return false; }
@@ -60,122 +215,49 @@ async function playInVoice(member, text, guildId) {
     const voiceChannel = member.voice?.channel;
     if (!voiceChannel) { console.log('[Voice] Member not in VC.'); return false; }
 
+    // If the monitor (voiceFlirtHandler) already owns a connection in this
+    // guild, route through it instead of trying to take over.
+    const existingConn = getVoiceConnection(guildId);
+    const ownWarm = warmConnections.get(guildId);
+    if (existingConn && existingConn !== ownWarm?.connection) {
+        console.log('[Voice] Routing through monitor connection.');
+        return playOnConnection(existingConn, guildId, text);
+    }
+
     activeSessions.add(guildId);
     state.recordVoiceJoin(guildId);
 
-    let connection;
     try {
         await sodium.ready;
 
-        console.log(`[Voice] Fetching TTS: "${text}"`);
-        const buffer = await fetchTTS(text);
-        console.log(`[Voice] Buffer size: ${buffer.length} bytes`);
+        console.log(`[Voice] Fetching TTS + joining VC in parallel: "${text}"`);
 
-        // Destroy any stale connection
-        const existing = getVoiceConnection(guildId);
-        if (existing) {
-            console.log('[Voice] Destroying stale connection...');
-            existing.destroy();
-            await new Promise(r => setTimeout(r, 1000));
-        }
+        // Run TTS fetch and channel join CONCURRENTLY — biggest single win.
+        const [buffer, entry] = await Promise.all([
+            fetchTTS(text),
+            getOrJoinConnection(voiceChannel, guildId),
+        ]);
 
-        // Join voice channel
-        connection = joinVoiceChannel({
-            channelId:      voiceChannel.id,
-            guildId,
-            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-            selfDeaf:       false,
-            debug:          true,
-        });
-        
-        connection.on('debug', msg => console.log('[VoiceDebug]', msg));
+        console.log(`[Voice] Ready. Buffer: ${buffer.length} bytes. Playing.`);
 
-        connection.on('stateChange', (oldSt, newSt) => {
-            console.log(`[VoiceState] ${oldSt.status} → ${newSt.status}`);
-        });
-
-        console.log('[Voice] Waiting for Ready...');
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-        console.log('[Voice] Connected! Playing audio...');
-
-        // MP3 → PCM via FFmpeg
-        const readable = new Readable();
-        readable.push(buffer);
-        readable.push(null);
-
-        const ffmpeg = new prism.FFmpeg({
-            args: ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2'],
-        });
-
-        const resource = createAudioResource(readable.pipe(ffmpeg), {
-            inputType: StreamType.Raw,
-        });
-
-        const player = createAudioPlayer();
-        player.on('error', err => console.error('[Voice] Player error:', err.message));
-
-        connection.subscribe(player);
-        player.play(resource);
-
-        await entersState(player, AudioPlayerStatus.Idle, 60_000);
+        entry.player.play(makeAudioResource(buffer));
+        await entersState(entry.player, AudioPlayerStatus.Idle, 60_000);
         console.log('[Voice] Playback done.');
 
-        connection.destroy();
+        // Keep connection warm; tear down after KEEPALIVE_MS of inactivity.
+        scheduleTeardown(guildId);
         return true;
 
     } catch (err) {
         console.error('[Voice] Error:', err.message);
-        try { connection?.destroy(); } catch (_) {}
+        const entry = warmConnections.get(guildId);
+        if (entry) {
+            try { entry.connection.destroy(); } catch (_) {}
+            warmConnections.delete(guildId);
+        }
         return false;
     } finally {
         activeSessions.delete(guildId);
-    }
-}
-
-// ─── Play on an existing connection ───────────────────────────────
-// Like playInVoice but uses an already-open connection and does NOT destroy
-// it afterwards. Used by voiceFlirtHandler so monitoring persists after TTS.
-
-const playingOnConnection = new Set(); // guildId → playing
-
-async function playOnConnection(connection, guildId, text) {
-    if (playingOnConnection.has(guildId)) {
-        console.log('[Voice] Already playing on connection, skipping.');
-        return false;
-    }
-    playingOnConnection.add(guildId);
-
-    try {
-        console.log(`[Voice] Fetching TTS (in-channel): "${text}"`);
-        const buffer = await fetchTTS(text);
-
-        const readable = new Readable();
-        readable.push(buffer);
-        readable.push(null);
-
-        const ffmpeg = new prism.FFmpeg({
-            args: ['-i', 'pipe:0', '-f', 's16le', '-ar', '48000', '-ac', '2'],
-        });
-
-        const resource = createAudioResource(readable.pipe(ffmpeg), {
-            inputType: StreamType.Raw,
-        });
-
-        const player = createAudioPlayer();
-        player.on('error', err => console.error('[Voice] Player error:', err.message));
-
-        connection.subscribe(player);
-        player.play(resource);
-
-        await entersState(player, AudioPlayerStatus.Idle, 60_000);
-        console.log('[Voice] In-channel playback done.');
-        return true;
-
-    } catch (err) {
-        console.error('[Voice] playOnConnection error:', err.message);
-        return false;
-    } finally {
-        playingOnConnection.delete(guildId);
     }
 }
 

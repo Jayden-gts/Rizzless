@@ -93,8 +93,6 @@ function setupSpeakingListener(connection, guild, guildId) {
             }
         });
 
-        // If the stream errors, un-block re-subscription
-        activeUsers.delete = activeUsers.delete.bind(activeUsers);
     });
 }
 
