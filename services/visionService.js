@@ -1,6 +1,31 @@
 'use strict';
 
+const { GoogleAuth } = require('google-auth-library');
+
 const VISION_URL = 'https://vision.googleapis.com/v1/images:annotate';
+
+// Explicit project ID — overrides any stale fallback project the auth library
+// might otherwise pick up. This is what Google bills for the call.
+const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT_ID || 'gen-lang-client-0420871328';
+
+// Service account auth. Reads GOOGLE_APPLICATION_CREDENTIALS (path to JSON key
+// file) from env. Tokens are cached and auto-refreshed by GoogleAuth, so this
+// is essentially free after the first call.
+const auth = new GoogleAuth({
+    scopes:         ['https://www.googleapis.com/auth/cloud-platform'],
+    projectId:      PROJECT_ID,
+});
+
+let cachedClient = null;
+async function getAuthClient() {
+    if (!cachedClient) {
+        cachedClient = await auth.getClient();
+        // Force the quota project so the API bills the right project,
+        // even if the credential file doesn't carry one.
+        cachedClient.quotaProjectId = PROJECT_ID;
+    }
+    return cachedClient;
+}
 
 // Labels that suggest romantic/flirtatious image content
 const ROMANTIC_LABELS = new Set([
@@ -10,7 +35,6 @@ const ROMANTIC_LABELS = new Set([
     'desire', 'seduction', 'relationship',
 ]);
 
-// Maps Vision API likelihood strings → score contribution
 const LIKELIHOOD_PTS = {
     VERY_LIKELY:    35,
     LIKELY:         20,
@@ -20,25 +44,18 @@ const LIKELIHOOD_PTS = {
     UNKNOWN:         0,
 };
 
-/**
- * Analyse a single image URL via Google Cloud Vision API.
- * Returns a { score: 0–100, reason: string } object.
- *
- * @param {string} imageUrl Publicly accessible image URL
- * @returns {Promise<{ score: number, reason: string }>}
- */
 async function analyzeImage(imageUrl) {
-    const apiKey = process.env.GOOGLE_CLOUD_API_KEY;
-    if (!apiKey) {
-        console.warn('[Vision] GOOGLE_CLOUD_API_KEY not set — skipping image analysis');
+    if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+        console.warn('[Vision] GOOGLE_APPLICATION_CREDENTIALS not set — skipping image analysis');
         return { score: 0, reason: 'Vision API not configured' };
     }
 
     try {
-        const res = await fetch(`${VISION_URL}?key=${apiKey}`, {
+        const client = await getAuthClient();
+        const res = await client.request({
+            url:    VISION_URL,
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+            data: {
                 requests: [{
                     image: { source: { imageUri: imageUrl } },
                     features: [
@@ -47,22 +64,16 @@ async function analyzeImage(imageUrl) {
                         { type: 'FACE_DETECTION',  maxResults: 5  },
                     ],
                 }],
-            }),
+            },
         });
 
-        if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            throw new Error(`Vision API ${res.status}: ${body}`);
-        }
-
-        const data     = await res.json();
+        const data     = res.data;
         const response = data.responses?.[0];
         if (!response) return { score: 0, reason: 'Empty Vision response' };
 
         let score   = 0;
         const hits  = [];
 
-        // ── SafeSearch (adult / racy content) ────────────────────────────────
         const safe = response.safeSearchAnnotation;
         if (safe) {
             const adultPts = LIKELIHOOD_PTS[safe.adult]  ?? 0;
@@ -71,17 +82,15 @@ async function analyzeImage(imageUrl) {
             if (racyPts  > 0) { score += racyPts;  hits.push(`racy content (${safe.racy})`);    }
         }
 
-        // ── Romantic label detection ─────────────────────────────────────────
         const labels = response.labelAnnotations ?? [];
         for (const label of labels) {
             if (ROMANTIC_LABELS.has(label.description.toLowerCase())) {
-                const pts = Math.round(label.score * 25); // confidence × 25 max
+                const pts = Math.round(label.score * 25);
                 score += pts;
                 hits.push(`"${label.description}" (${Math.round(label.score * 100)}% confidence)`);
             }
         }
 
-        // ── Face emotion boost ────────────────────────────────────────────────
         const faces = response.faceAnnotations ?? [];
         for (const face of faces) {
             if (face.joyLikelihood === 'VERY_LIKELY' || face.joyLikelihood === 'LIKELY') {
@@ -103,29 +112,17 @@ async function analyzeImage(imageUrl) {
     }
 }
 
-/**
- * Extract image attachment URLs from a Discord message.
- * Filters to known image content types only.
- *
- * @param {import('discord.js').Message} message
- * @returns {string[]} Array of image URLs
- */
 function getImageUrls(message) {
     const urls = [];
-
-    // Attachments (uploaded files)
     for (const att of message.attachments.values()) {
         if (att.contentType?.startsWith('image/')) {
             urls.push(att.url);
         }
     }
-
-    // Embeds with image thumbnails or images
     for (const embed of message.embeds) {
         if (embed.image?.url)     urls.push(embed.image.url);
         if (embed.thumbnail?.url) urls.push(embed.thumbnail.url);
     }
-
     return urls;
 }
 

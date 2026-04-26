@@ -44,7 +44,13 @@ async function handle(message) {
     ]);
 
     const imageScore = imageResults.reduce((max, r) => Math.max(max, r.score), 0);
-    const score      = combineScores(textScore, imageScore);
+    // Pull the reason from whichever image scored highest (or empty if no images)
+    const topImage = imageResults.reduce(
+        (best, r) => (r.score > (best?.score ?? -1) ? r : best),
+        null,
+    );
+    const imageReason = topImage && topImage.score > 0 ? topImage.reason : null;
+    const score = combineScores(textScore, imageScore);
 
     state.ensureUser(userId);
     state.recordMessage(userId, message.content, score, targetId);
@@ -64,9 +70,9 @@ async function handle(message) {
     responseCooldown.set(responseKey, Date.now());
 
     const username         = message.author.username;
-    const chatQuipPromise  = generateAdaptiveQuip(message.content, score, username, false);
+    const chatQuipPromise  = generateAdaptiveQuip(message.content, score, username, false, imageReason);
     const voiceQuipPromise = score >= THRESH_VOICE
-        ? generateAdaptiveQuip(message.content, score, username, true)
+        ? generateAdaptiveQuip(message.content, score, username, true, imageReason)
         : null;
 
     if (voiceQuipPromise) {
