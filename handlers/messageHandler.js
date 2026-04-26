@@ -6,6 +6,7 @@ const { scoreMessage, extractTargetId } = require('../services/scoringService');
 const { analyzeImage, getImageUrls }    = require('../services/visionService');
 const { playInVoice }                   = require('../services/voiceService');
 const { generateAdaptiveQuip }          = require('../services/adaptiveQuipService');
+const { flagUser, clearUser }           = require('../services/roleService');
 const { handleDMEscalation, handleCheatDetection, handleTimeout } = require('../services/moderationService');
 const { pickMild, pickStrong, pickAggressive, pickVoice, pickMeme } = require('../config/responses');
 
@@ -44,7 +45,6 @@ async function handle(message) {
     ]);
 
     const imageScore = imageResults.reduce((max, r) => Math.max(max, r.score), 0);
-    // Pull the reason from whichever image scored highest (or empty if no images)
     const topImage = imageResults.reduce(
         (best, r) => (r.score > (best?.score ?? -1) ? r : best),
         null,
@@ -61,6 +61,15 @@ async function handle(message) {
         `text: ${String(textScore).padStart(3)}${imagePart} | final: ${score} | ` +
         `"${message.content.slice(0, 50).replace(/\n/g, ' ')}"`
     );
+
+    // Flag or clear leaderboard based on score
+    if (score >= 60) {
+        flagUser(message.member, score)
+            .catch(err => console.error('[Handler] Flag error:', err.message));
+    } else if (score < 30) {
+        clearUser(message.member)
+            .catch(err => console.error('[Handler] Clear error:', err.message));
+    }
 
     if (score < THRESH_MILD) return;
 
@@ -102,7 +111,10 @@ async function handle(message) {
     })();
 
     const chatPromise = chatTextPromise
-        .then(reply => message.channel.send(reply))
+        .then(reply => message.channel.send({
+            content: `<@${userId}> ${reply}`,
+            allowedMentions: { users: [userId] },
+        }))
         .catch(err => console.error('[Handler] Chat response error:', err.message));
 
     if (score >= THRESH_MEME && state.canPostMeme(message.channel.id)) {

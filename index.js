@@ -13,6 +13,7 @@ const {
 
 const { handle }      = require('./handlers/messageHandler');
 const { joinAndMonitor, onMemberLeave } = require('./handlers/voiceFlirtHandler');
+const { setupLeaderboard }             = require('./services/roleService');
 const state           = require('./state/stateManager');
 
 const REQUIRED_ENV = ['DISCORD_TOKEN', 'CLIENT_ID'];
@@ -75,6 +76,12 @@ client.once('ready', async () => {
     console.log(`\n🤖 Rizzless is online as ${client.user.tag}`);
     console.log(`   Guilds: ${client.guilds.cache.size}`);
     await registerCommands();
+
+    for (const guild of client.guilds.cache.values()) {
+        await setupLeaderboard(guild).catch(err =>
+            console.error(`[Leaderboard] Setup failed in ${guild.name}:`, err.message)
+        );
+    }
 });
 
 // ─── Messages ─────────────────────────────────────────────────────
@@ -93,7 +100,7 @@ client.on('interactionCreate', async interaction => {
             .setTitle('📊 Rizzless Report')
             .setColor(getRizzColour(score))
             .addFields(
-                { name: 'User',   value: `<@${target.id}>`,   inline: true },
+                { name: 'User',   value: `<@${target.id}>`,    inline: true },
                 { name: 'Score',  value: `**${score} / 100**`, inline: true },
                 { name: 'Status', value: getRizzLabel(score),   inline: true },
             )
@@ -113,19 +120,15 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
     const guildId = (newState.guild ?? oldState.guild).id;
 
-    // ── Member left a channel ────────────────────────────────────────────────
     if (oldState.channelId && !newState.channelId) {
         onMemberLeave(oldState);
         return;
     }
 
-    // ── Member moved between channels ────────────────────────────────────────
     if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
-        onMemberLeave(oldState); // may trigger leave-if-empty for old channel
-        // fall through to handle as a fresh join in the new channel
+        onMemberLeave(oldState);
     }
 
-    // ── Fresh join ───────────────────────────────────────────────────────────
     if (!newState.channelId) return;
 
     if (voiceJoinLock.has(guildId)) return;
@@ -141,7 +144,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
             return;
         }
 
-        // Find the first text channel the bot can write to (for moderation messages)
         const textChannel = newState.guild.channels.cache.find(
             ch => ch.isTextBased() && ch.permissionsFor(newState.guild.members.me)?.has('SendMessages')
         ) ?? null;
