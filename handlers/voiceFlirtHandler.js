@@ -24,7 +24,7 @@ const VOICE_STRONG_THRESHOLD = 60;
 // the entire pipeline (transcription + scoring + quip) for that user — saves
 // API quota and prevents the bot from spamming someone who keeps talking.
 // Set per-user-per-guild. Override via env var if needed.
-const VOICE_CALLOUT_COOLDOWN_MS = Number(process.env.VOICE_CALLOUT_COOLDOWN_MS) || 15_000;
+const VOICE_CALLOUT_COOLDOWN_MS = Number(process.env.VOICE_CALLOUT_COOLDOWN_MS) || 5_000;
 
 // ─── Per-guild state ──────────────────────────────────────────────────────────
 // guildId → Set<userId> — tracks users we've already subscribed to this utterance
